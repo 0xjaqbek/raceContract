@@ -1,97 +1,154 @@
 #include "imports/stdlib.fc";
 
-;; =============== storage =============================
+;; Constants
+const int ENTRY_FEE = 1000000000; ;; 1 TON
+const int PAYOUT_PERCENTAGE = 90;
+const int SECONDS_IN_DAY = 86400;
 
-(cell, int) load_data() inline {
-    var ds = get_data().begin_parse();
-    var num_entries = ds~load_uint(4); ;; max 16 entries but we will use only 10
-    var leaderboard_refs = ds~load_ref();
-    return (leaderboard_refs, num_entries);
-}
+;; Storage structure
+;; owner:MsgAddress lastPayout:uint64 totalFees:uint120 currentTournamentNumber:uint32 bestTime:uint64 bestPlayer:MsgAddress
+;; playerEntries:(HashmapE 267 (PlayerEntry))
 
-() save_data(cell leaderboard_refs, int num_entries) impure inline {
+;; PlayerEntry structure: time:uint64 timestamp:uint64 tournamentNumber:uint32
+
+() save_data(slice owner, int lastPayout, int totalFees, int currentTournamentNumber, int bestTime, slice bestPlayer, cell playerEntries) impure inline {
     set_data(begin_cell()
-        .store_uint(num_entries, 4)
-        .store_ref(leaderboard_refs)
+        .store_slice(owner)
+        .store_uint(lastPayout, 64)
+        .store_uint(totalFees, 120)
+        .store_uint(currentTournamentNumber, 32)
+        .store_uint(bestTime, 64)
+        .store_slice(bestPlayer)
+        .store_dict(playerEntries)
         .end_cell());
 }
 
-;; =============== constructor =============================
-
-() constructor() impure {
-    ;; Initialize the state. Create an empty leaderboard and set number of entries to 0.
-    cell empty_leaderboard = begin_cell().end_cell();
-    int initial_num_entries = 0;
-    save_data(empty_leaderboard, initial_num_entries);
+(slice, int, int, int, int, slice, cell) load_data() inline {
+    slice ds = get_data().begin_parse();
+    return (
+        ds~load_msg_addr(),    ;; owner
+        ds~load_uint(64),      ;; lastPayout
+        ds~load_uint(120),     ;; totalFees
+        ds~load_uint(32),      ;; currentTournamentNumber
+        ds~load_uint(64),      ;; bestTime
+        ds~load_msg_addr(),    ;; bestPlayer
+        ds~load_dict()         ;; playerEntries
+    );
 }
 
-;; =============== messages =============================
-
-() recv_internal(int msg_value, cell in_msg, slice in_msg_body) impure {
-    ;; Ensure that the message body is not empty
-    if (in_msg_body.slice_empty?()) {
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) { ;; ignore empty messages
         return ();
     }
-    ;; Load the operation code from the message body
-    int op = in_msg_body~load_uint(32);
-    ;; Load the current leaderboard data from the contract storage
-    var (leaderboard, num_entries) = load_data();
-
-    if (op == 1) {
-        ;; Load the new time and address from the message body
-        int new_time = in_msg_body~load_uint(64);
-        cell new_address = in_msg_body~load_ref();
-
-        var updated_leaderboard = begin_cell();
-        int inserted = 0; ;; boolean represented as int (0 = false, 1 = true)
-        int updated = 0; ;; boolean represented as int (0 = false, 1 = true)
-        var ds = leaderboard.begin_parse();
-
-        ;; Iterate over the current leaderboard entries using a while loop
-        int i = 0;
-        while (i < num_entries) {
-            int time = ds~load_uint(64);
-            cell address = ds~load_ref();
-
-            ;; Compare the current address with the new address
-            var address_slice = address.begin_parse();
-            var new_address_slice = new_address.begin_parse();
-
-            ;; Extract the first 32 bytes of the address for comparison
-            int address_bytes = address_slice~load_uint(256); ;; Load as uint with appropriate bit length
-            int new_address_bytes = new_address_slice~load_uint(256); ;; Same length
-
-            if (address_bytes == new_address_bytes) {
-                ;; Update the entry if the new time is shorter
-                if (new_time < time) {
-                    updated_leaderboard = updated_leaderboard.store_uint(new_time, 64).store_ref(new_address);
-                    updated = 1;
-                } else {
-                    ;; Keep the old entry if the new time is not shorter
-                    updated_leaderboard = updated_leaderboard.store_uint(time, 64).store_ref(address);
-                }
-                inserted = 1; ;; Mark that we have handled this address
-            } else {
-                ;; Preserve the existing entry
-                updated_leaderboard = updated_leaderboard.store_uint(time, 64).store_ref(address);
-            }
-            i = i + 1;
-        }
-
-        ;; Add the new entry if it was not inserted and there is space
-        if ((inserted == 0) & (num_entries < 10)) {
-            updated_leaderboard = updated_leaderboard.store_uint(new_time, 64).store_ref(new_address);
-            num_entries += 1;
-        }
-
-        ;; Save the updated leaderboard back to storage
-        save_data(updated_leaderboard.end_cell(), num_entries);
+    
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    
+    if (flags & 1) { ;; ignore all bounced messages
+        return ();
     }
+    
+    slice sender_address = cs~load_msg_addr();
+    
+    (slice owner, int lastPayout, int totalFees, int currentTournamentNumber, int bestTime, slice bestPlayer, cell playerEntries) = load_data();
+    
+    int op = in_msg_body~load_uint(32);
+    
+    if (op == 0x44) { ;; Deploy
+        ;; Contract deployment logic (if needed)
+        return ();
+    }
+    
+    if (op == 0x9fd3) { ;; RecordTime
+        throw_unless(450, msg_value >= ENTRY_FEE);
+        
+        int time = in_msg_body~load_uint(64);
+        int currentTimestamp = now();
+        
+        totalFees += ENTRY_FEE;
+        
+        int sender_key = sender_address.preload_uint(256);
+        playerEntries~udict_set_builder(267, sender_key, begin_cell()
+            .store_uint(time, 64)
+            .store_uint(currentTimestamp, 64)
+            .store_uint(currentTournamentNumber, 32));
+        
+        if ((bestTime == 0) | (time < bestTime)) {
+            bestTime = time;
+            bestPlayer = sender_address;
+        }
+        
+        save_data(owner, lastPayout, totalFees, currentTournamentNumber, bestTime, bestPlayer, playerEntries);
+        return ();
+    }
+    
+    if (op == 0xf8a7) { ;; DistributePrize
+        int tournamentNumber = in_msg_body~load_uint(32);
+        int currentDay = now() / SECONDS_IN_DAY;
+        int lastPayoutDay = lastPayout / SECONDS_IN_DAY;
+        
+        throw_unless(451, currentDay > lastPayoutDay);
+        throw_unless(452, tournamentNumber < currentTournamentNumber);
+        throw_unless(453, ~ equal_slices(bestPlayer, begin_cell().store_uint(0, 2).end_cell().begin_parse()));
+        
+        int sender_key = sender_address.preload_uint(256);
+        (slice playerEntry, int success) = playerEntries.udict_get?(267, sender_key);
+        throw_unless(454, success);
+        throw_unless(455, playerEntry~load_uint(32) == tournamentNumber);
+        
+        int prizeAmount = (totalFees * PAYOUT_PERCENTAGE) / 100;
+        var msg = begin_cell()
+            .store_uint(0x10, 6)
+            .store_slice(bestPlayer)
+            .store_coins(prizeAmount)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .end_cell();
+        send_raw_message(msg, 1);
+        
+        totalFees -= prizeAmount;
+        lastPayout = currentDay * SECONDS_IN_DAY;
+        bestTime = 0;
+        bestPlayer = begin_cell().store_uint(0, 2).end_cell().begin_parse();
+        currentTournamentNumber += 1;
+        
+        save_data(owner, lastPayout, totalFees, currentTournamentNumber, bestTime, bestPlayer, playerEntries);
+        return ();
+    }
+    
+    if (op == 0x0cab) { ;; WithdrawFees
+        throw_unless(456, equal_slices(sender_address, owner));
+        
+        var msg = begin_cell()
+            .store_uint(0x10, 6)
+            .store_slice(owner)
+            .store_coins(totalFees)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .end_cell();
+        send_raw_message(msg, 1);
+        
+        totalFees = 0;
+        
+        save_data(owner, lastPayout, totalFees, currentTournamentNumber, bestTime, bestPlayer, playerEntries);
+        return ();
+    }
+    
+    throw(0xffff);
 }
 
-;; =============== getters =============================
+;; Get methods
 
-cell get_leaderboard() method_id {
-    var (leaderboard, _) = load_data();
-    return leaderboard;
+(int, int, int, slice) get_info() method_id {
+    (slice owner, int lastPayout, int totalFees, int currentTournamentNumber, int bestTime, slice bestPlayer, _) = load_data();
+    return (bestTime, totalFees, currentTournamentNumber, bestPlayer);
+}
+
+(int, int, int) get_player_entry(slice player_address) method_id {
+    (_, _, _, _, _, _, cell playerEntries) = load_data();
+    int player_key = player_address.preload_uint(256);
+    (slice playerEntry, int success) = playerEntries.udict_get?(267, player_key);
+    if (success) {
+        return (playerEntry~load_uint(64), playerEntry~load_uint(64), playerEntry~load_uint(32));
+    } else {
+        return (0, 0, 0);
+    }
 }

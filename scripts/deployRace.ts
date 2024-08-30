@@ -1,26 +1,25 @@
 import { toNano } from '@ton/core';
-import { Race, RaceEntry, Opcodes } from '../wrappers/Race';
+import { Race } from '../wrappers/Race';
 import { compile, NetworkProvider } from '@ton/blueprint';
 
 export async function run(provider: NetworkProvider) {
     const senderAddress = provider.sender().address;
-
     if (!senderAddress) {
         throw new Error('Sender address is undefined');
     }
 
-    const initialEntries: RaceEntry[] = Array(10).fill({ time: 0, address: senderAddress });
+    // Compile contract code
+    const code = await compile('Race');
 
-    const race = provider.open(
-        Race.createFromConfig(
-            initialEntries,
-            await compile('Race')
-        )
-    );
+    // Create the Race contract instance
+    const race = provider.open(Race.createFromConfig(senderAddress, code));
 
-    await race.sendDeploy(provider.sender(), toNano('0.05'));
-
-    await provider.waitForDeploy(race.address);
-
-    console.log('Leaderboard:', await race.getLeaderboard());
+    try {
+        // Deploy contract
+        await race.sendDeploy(provider.sender(), toNano('0.5'));
+        await provider.waitForDeploy(race.address);
+        console.log('Contract deployed successfully at:', race.address);
+    } catch (error) {
+        console.error('Deployment failed:', error instanceof Error ? error.message : String(error));
+    }
 }

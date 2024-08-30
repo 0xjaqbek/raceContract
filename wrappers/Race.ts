@@ -1,4 +1,14 @@
-import { Address, beginCell, Cell, Contract, contractAddress, ContractProvider, Sender, SendMode, Builder } from '@ton/core';
+import {
+    Address,
+    beginCell,
+    Cell,
+    Contract,
+    contractAddress,
+    ContractProvider,
+    Sender,
+    SendMode,
+    toNano
+} from '@ton/core';
 
 export type RaceEntry = {
     time: number;
@@ -6,7 +16,9 @@ export type RaceEntry = {
 };
 
 export const Opcodes = {
-    update: 0x1,
+    recordTime: 0x9fd3,
+    distributePrize: 0xf8a7,
+    withdrawFees: 0x0cab
 };
 
 export class Race implements Contract {
@@ -16,91 +28,120 @@ export class Race implements Contract {
         return new Race(address);
     }
 
-    static createFromConfig(entries: RaceEntry[], code: Cell, workchain = 0) {
-        const data = Race.raceEntriesToCell(entries);
+    static createFromConfig(owner: Address, code: Cell, workchain = 0) {
+        const data = Race.createDataCell(owner);
         const init = { code, data };
         return new Race(contractAddress(workchain, init), init);
     }
 
-    static raceEntriesToCell(entries: RaceEntry[]): Cell {
-        const builder = beginCell();
-        
-        // Store the number of entries
-        builder.storeUint(entries.length, 4);
-
-        let leaderboardBuilder = beginCell();
-        let bitsUsed = 0;
-        const bitsPerEntry = 64 + 267; // 64 bits for time, 267 bits for address
-
-        entries.forEach((entry) => {
-            // If adding this entry exceeds the cell's capacity, store the current cell and start a new one
-            if (bitsUsed + bitsPerEntry > 1023) {
-                builder.storeRef(leaderboardBuilder.endCell());
-                leaderboardBuilder = beginCell();
-                bitsUsed = 0;
-            }
-            
-            leaderboardBuilder.storeUint(entry.time, 64).storeAddress(entry.address);
-            bitsUsed += bitsPerEntry;
-        });
-
-        // Store the remaining data
-        builder.storeRef(leaderboardBuilder.endCell());
-
-        return builder.endCell();
+    static createDataCell(owner: Address): Cell {
+        return beginCell()
+            .storeAddress(owner)
+            .storeUint(0, 64) // lastPayout
+            .storeUint(0, 120) // totalFees
+            .storeUint(0, 32) // currentTournamentNumber
+            .storeUint(0, 64) // bestTime
+            .storeAddress(Address.parse('0:0000000000000000000000000000000000000000000000000000000000000000')) // bestPlayer
+            .storeDict(null) // playerEntries
+            .endCell();
     }
 
     async sendDeploy(provider: ContractProvider, via: Sender, value: bigint) {
         await provider.internal(via, {
             value,
             sendMode: SendMode.PAY_GAS_SEPARATELY,
-            body: beginCell().endCell(),
+            body: beginCell().storeUint(0x44, 32).endCell(),
         });
     }
 
-    async sendUpdate(
+    async sendRecordTime(
         provider: ContractProvider,
         via: Sender,
         opts: {
-            op: number;
-            newTime: number;
-            newAddress: Address;
-            value: bigint;
-            queryID?: number;
+            time: number;
+            value?: bigint;
         }
     ) {
         await provider.internal(via, {
-            value: opts.value,
+            value: opts.value ?? toNano('1.1'),
             sendMode: SendMode.PAY_GAS_SEPARATELY,
             body: beginCell()
-                .storeUint(opts.op, 32)
-                .storeUint(opts.queryID ?? 0, 64)
-                .storeUint(BigInt(opts.newTime), 64)
-                .storeAddress(opts.newAddress)
+                .storeUint(Opcodes.recordTime, 32)
+                .storeUint(opts.time, 64)
                 .endCell(),
         });
     }
 
-    async getAddressAndTime(provider: ContractProvider, index: number) {
-        const result = await provider.get('get_address_and_time', [{ type: 'int', value: BigInt(index) }]);
-        const time = BigInt(result.stack.readNumber());
-        const address = result.stack.readAddress();
-        return { time, address };
+    async sendDistributePrize(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            tournamentNumber: number;
+            value?: bigint;
+        }
+    ) {
+        await provider.internal(via, {
+            value: opts.value ?? toNano('0.1'),
+            sendMode: SendMode.PAY_GAS_SEPARATELY,
+            body: beginCell()
+                .storeUint(Opcodes.distributePrize, 32)
+                .storeUint(opts.tournamentNumber, 32)
+                .endCell(),
+        });
     }
 
-    async getLeaderboard(provider: ContractProvider) {
-        const result = await provider.get('get_leaderboard', []);
-        const leaderboard = result.stack.readCell();
-        const numEntries = leaderboard.beginParse().loadUint(4);
-        let entries: RaceEntry[] = [];
-
-        let ds = leaderboard.beginParse();
-        for (let i = 0; i < numEntries; i++) {
-            const time = ds.loadUint(64);
-            const address = ds.loadAddress();
-            entries.push({ time, address });
+    async sendWithdrawFees(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value?: bigint;
         }
+    ) {
+        await provider.internal(via, {
+            value: opts.value ?? toNano('0.1'),
+            sendMode: SendMode.PAY_GAS_SEPARATELY,
+            body: beginCell()
+                .storeUint(Opcodes.withdrawFees, 32)
+                .endCell(),
+        });
+    }
 
-        return entries;
+    async getInfo(provider: ContractProvider): Promise<{
+        bestTime: number;
+        totalFees: bigint;
+        currentTournamentNumber: number;
+        bestPlayer: Address;
+    }> {
+        const result = await provider.get('get_info', []);
+        return {
+            bestTime: result.stack.readNumber(),
+            totalFees: result.stack.readBigNumber(),
+            currentTournamentNumber: result.stack.readNumber(),
+            bestPlayer: result.stack.readAddress(),
+        };
+    }
+
+    async getPlayerEntry(provider: ContractProvider, address: Address): Promise<{
+        time: number;
+        timestamp: number;
+        tournamentNumber: number;
+    } | null> {
+        const result = await provider.get('get_player_entry', [
+            { type: 'slice', cell: beginCell().storeAddress(address).endCell() },
+        ]);
+        
+        const time = result.stack.readNumber();
+        const timestamp = result.stack.readNumber();
+        const tournamentNumber = result.stack.readNumber();
+
+        if (time === 0 && timestamp === 0 && tournamentNumber === 0) {
+            return null;
+        }
+        
+        return {
+            time,
+            timestamp,
+            tournamentNumber,
+        };
     }
 }
